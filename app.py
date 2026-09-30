@@ -29,7 +29,7 @@ lock = threading.Lock()
 play_stop = threading.Event()
 ocr_cache = {}
 templates = [(row['letter'], int(row['bits'], 16)) for row in json.loads((ROOT / 'glyph_templates.json').read_text())]
-state = {'window': None, 'crop': None, 'board': '', 'words': [], 'image': '', 'status': 'Waiting for iPhone Mirroring', 'updated': 0, 'tiles': [], 'glyphs': [], 'boxes': [], 'capture_size': None, 'window_pid': None, 'stable_board': '', 'stable_since': 0, 'playback': {'armed': False, 'running': False, 'played': 0, 'total': 0, 'current': '', 'error': ''}}
+state = {'window': None, 'crop': None, 'board': '', 'words': [], 'image': '', 'status': 'Waiting for iPhone Mirroring', 'updated': 0, 'tiles': [], 'glyphs': [], 'confidence': [], 'boxes': [], 'capture_size': None, 'window_pid': None, 'stable_board': '', 'stable_since': 0, 'after_patterns': [], 'playback': {'armed': False, 'running': False, 'played': 0, 'total': 0, 'current': '', 'error': ''}}
 
 
 def db():
@@ -281,7 +281,7 @@ def read_board(image, boxes):
         if matches and matches[0][0] < .09:
             letters[i] = matches[0][1]
             confidence[i] = 1
-    return letters, signatures, patterns
+    return letters, signatures, patterns, confidence
 
 
 WORDS = None
@@ -394,9 +394,10 @@ def scan():
         state['crop'] = crop
         state['boxes'] = boxes or []
         if boxes:
-            letters, sigs, patterns = read_board(image, boxes)
+            letters, sigs, patterns, confidence = read_board(image, boxes)
             state['tiles'] = sigs
             state['glyphs'] = patterns
+            state['confidence'] = confidence
             board = ''.join(s[:1] if s else '?' for s in letters)
             if '?' not in board:
                 if board != state['board']:
@@ -412,12 +413,16 @@ def scan():
             state['words'] = []
             state['tiles'] = []
             state['glyphs'] = []
+            state['confidence'] = []
             state['status'] = 'No 4×4 grid visible—show Word Hunt in iPhone Mirroring'
         state['updated'] = time.time()
         if state['board'] != state['stable_board']:
             state['stable_board'] = state['board']
             state['stable_since'] = time.time()
         if (state['playback']['armed'] and state['boxes'] and state['words']
+                and state['board'] != state['playback'].get('after_board')
+                and (not state['after_patterns'] or
+                     matching_patterns(state['after_patterns'], state['glyphs']) <= 14)
                 and time.time() - state['stable_since'] >= .5):
             launch_playback_locked()
 
@@ -461,24 +466,54 @@ def swipe(points):
         post_mouse(Quartz.kCGEventLeftMouseUp, last)
 
 
-def same_board(snapshot):
-    for attempt in range(3):
-        image = capture(snapshot['window'])
-        old_w, old_h = snapshot['size']
-        new_w, new_h = image.size
-        boxes = [(int(x0*new_w/old_w),int(y0*new_h/old_h),
-                  int(x1*new_w/old_w),int(y1*new_h/old_h))
-                 for x0,y0,x1,y1 in snapshot['boxes']]
-        patterns = [glyph_pattern(image.crop(box)) for box in boxes]
-        matches = sum(a is not None and b is not None and
-                      (a ^ b).bit_count()/784 < .12
-                      for a,b in zip(snapshot['patterns'], patterns))
-        if matches >= 12:
-            return True
-        if matches < 8:
-            return False
+def board_patterns(snapshot):
+    image = capture(snapshot['window'])
+    old_w, old_h = snapshot['size']
+    new_w, new_h = image.size
+    boxes = [(int(x0*new_w/old_w), int(y0*new_h/old_h),
+              int(x1*new_w/old_w), int(y1*new_h/old_h))
+             for x0,y0,x1,y1 in snapshot['boxes']]
+    return [glyph_pattern(image.crop(box)) for box in boxes]
+
+
+def matching_patterns(first, second):
+    return sum(a is not None and b is not None and
+               (a ^ b).bit_count()/784 < .10
+               for a,b in zip(first, second))
+
+
+def wait_for_board_refresh(snapshot, timeout=5):
+    # A selected word briefly changes tile artwork. Require a different grid
+    # that stays visually steady before reading or playing from it.
+    deadline = time.monotonic() + timeout
+    candidate = None
+    candidate_since = 0
+    time.sleep(.25)
+    while time.monotonic() < deadline and not play_stop.is_set():
+        patterns = board_patterns(snapshot)
+        changed = 16 - matching_patterns(snapshot['patterns'], patterns)
+        if changed >= 2:
+            if candidate is not None and matching_patterns(candidate, patterns) >= 15:
+                if time.monotonic() - candidate_since >= .35:
+                    return True
+            else:
+                candidate = patterns
+                candidate_since = time.monotonic()
+        else:
+            candidate = None
         time.sleep(.12)
     return False
+
+
+def autoplay_word(item):
+    # The visible list can be exploratory; auto-play uses only familiar entries.
+    with db() as con:
+        row = con.execute('SELECT adjustment FROM words WHERE word=?',
+                          (item['word'].lower(),)).fetchone()
+    if row and row[0] > 0:
+        return True
+    minimum = 3.8 if len(item['word']) >= 5 else 4.2
+    return familiarity(item['word'].lower()) >= minimum
 
 
 def focus_mirroring(pid):
@@ -528,33 +563,38 @@ def play_words(snapshot):
     board_changed = False
     try:
         focus_mirroring(snapshot['pid'])
-        for index, item in enumerate(snapshot['words']):
-            if play_stop.is_set():
-                break
-            available = next((w for w in windows() if w['id'] == snapshot['window']), None)
-            if not available:
-                raise RuntimeError('iPhone Mirroring is no longer open')
-            if not same_board(snapshot):
-                board_changed = True
-                break
-            focus_mirroring(snapshot['pid'])
-            bounds = available['bounds']
-            if not bounds:
-                raise RuntimeError('Could not locate the Mirroring window')
-            width, height = snapshot['size']
-            points = []
-            for tile_index in item['path']:
-                x0,y0,x1,y1 = snapshot['boxes'][tile_index]
-                points.append((bounds['X'] + (x0+x1)/2 * bounds['Width']/width,
-                               bounds['Y'] + (y0+y1)/2 * bounds['Height']/height))
+        item = next((word for word in snapshot['words']
+                     if autoplay_word(word) and all(snapshot['confidence'][i] >= 2
+                                                   for i in word['path'])), None)
+        if item is None:
+            raise RuntimeError('No familiar word has fully verified letters; correct the grid to continue')
+        available = next((w for w in windows() if w['id'] == snapshot['window']), None)
+        if not available:
+            raise RuntimeError('iPhone Mirroring is no longer open')
+        if matching_patterns(snapshot['patterns'], board_patterns(snapshot)) < 15:
+            raise RuntimeError('Board changed before the swipe; press Play again')
+        focus_mirroring(snapshot['pid'])
+        bounds = available['bounds']
+        if not bounds:
+            raise RuntimeError('Could not locate the Mirroring window')
+        width, height = snapshot['size']
+        points = []
+        for tile_index in item['path']:
+            x0,y0,x1,y1 = snapshot['boxes'][tile_index]
+            points.append((bounds['X'] + (x0+x1)/2 * bounds['Width']/width,
+                           bounds['Y'] + (y0+y1)/2 * bounds['Height']/height))
+        with lock:
+            state['playback']['current'] = item['word']
+        swipe(points)
+        if not play_stop.is_set():
             with lock:
-                state['playback']['current'] = item['word']
-            swipe(points)
-            if play_stop.is_set():
-                break
-            with lock:
-                state['playback']['played'] = index+1
-            time.sleep(.18)
+                state['playback']['current'] = f'Waiting for board refresh after {item["word"]}'
+            board_changed = wait_for_board_refresh(snapshot)
+            if board_changed:
+                with lock:
+                    state['playback']['played'] += 1
+            else:
+                raise RuntimeError(f'No new board appeared after {item["word"]}; playback paused')
     except Exception as exc:
         error = str(exc)
     finally:
@@ -565,15 +605,20 @@ def play_words(snapshot):
             # Successful words consume tiles in this game. Resume on the new board.
             if board_changed and not play_stop.is_set():
                 state['playback']['armed'] = True
+                state['playback']['after_board'] = snapshot['board']
+                state['after_patterns'] = snapshot['patterns']
                 state['stable_board'] = ''
 
 
 def launch_playback_locked():
     snapshot = {'window': state['window'], 'pid': state['window_pid'],
                 'size': state['capture_size'], 'boxes': list(state['boxes']),
-                'patterns': list(state['glyphs']), 'words': list(state['words'])}
+                'patterns': list(state['glyphs']), 'confidence': list(state['confidence']),
+                'words': list(state['words']),
+                'board': state['board']}
     play_stop.clear()
-    state['playback'] = {'armed': False, 'running': True, 'played': 0,
+    played = state['playback']['played']
+    state['playback'] = {'armed': False, 'running': True, 'played': played,
                          'total': len(snapshot['words']), 'current': '', 'error': ''}
     threading.Thread(target=play_words, args=(snapshot,), daemon=True).start()
 
@@ -586,7 +631,7 @@ def home():
 @app.get('/api/state')
 def api_state():
     with lock:
-        return jsonify({k:v for k,v in state.items() if k not in ('tiles','glyphs','boxes','capture_size','window_pid')})
+        return jsonify({k:v for k,v in state.items() if k not in ('tiles','glyphs','confidence','boxes','capture_size','window_pid','after_patterns')})
 
 
 @app.post('/api/play/start')
@@ -599,6 +644,7 @@ def api_play_start():
             return jsonify(ok=True)
         state['playback'] = {'armed': True, 'running': False, 'played': 0,
                              'total': 0, 'current': '', 'error': ''}
+        state['after_patterns'] = []
         state['stable_board'] = ''
     return jsonify(ok=True, waiting=True)
 
@@ -646,6 +692,7 @@ def api_board():
                     con.execute('INSERT OR REPLACE INTO glyphs VALUES (?,?,?)', (sig,letter,f'{pattern:0196x}'))
                     templates.append((letter, pattern))
         state['board'] = text
+        state['confidence'] = [3] * 16
         state['words'] = solve(list(text))
         state['status'] = f'Corrected • {len(state["words"])} words'
     return jsonify(ok=True)
