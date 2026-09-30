@@ -20,9 +20,10 @@ if [[ ! -x "$VENV/bin/python" ]]; then
   fi
   "$PYTHON" -m venv "$VENV" || exit 1
 fi
-if [[ ! -f "$VENV/.wordhunt-installed" ]]; then
+REQUIREMENTS_HASH="$(/usr/bin/shasum requirements.txt | /usr/bin/awk '{print $1}')"
+if [[ ! -f "$VENV/.wordhunt-installed" ]] || [[ "$(<"$VENV/.wordhunt-installed")" != "$REQUIREMENTS_HASH" ]]; then
   "$VENV/bin/python" -m pip install -r requirements.txt || exit 1
-  touch "$VENV/.wordhunt-installed"
+  print -r -- "$REQUIREMENTS_HASH" > "$VENV/.wordhunt-installed"
 fi
 (for i in {1..120}; do
   if /usr/bin/curl -fsS http://127.0.0.1:8765/api/state >/dev/null 2>&1; then

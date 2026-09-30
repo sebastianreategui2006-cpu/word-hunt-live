@@ -17,6 +17,7 @@ from flask import Flask, jsonify, render_template, request
 from PIL import Image, ImageEnhance, ImageOps
 import Quartz
 import AppKit
+import ApplicationServices
 import Vision
 from Foundation import NSURL
 from wordfreq import zipf_frequency
@@ -480,15 +481,53 @@ def same_board(snapshot):
     return False
 
 
+def focus_mirroring(pid):
+    workspace = AppKit.NSWorkspace.sharedWorkspace()
+
+    def is_front():
+        front = workspace.frontmostApplication()
+        return front is not None and front.processIdentifier() == pid
+
+    if is_front():
+        return
+    target = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+    if target is None:
+        raise RuntimeError('iPhone Mirroring is no longer open')
+    target.activateWithOptions_(AppKit.NSApplicationActivateIgnoringOtherApps)
+    if is_front():
+        return
+
+    # Raising the actual window handles the case where Play was clicked in a
+    # browser that remains frontmost while its HTTP request is being handled.
+    ax_app = ApplicationServices.AXUIElementCreateApplication(pid)
+    err, ax_windows = ApplicationServices.AXUIElementCopyAttributeValue(
+        ax_app, ApplicationServices.kAXWindowsAttribute, None)
+    if err == 0 and ax_windows:
+        ApplicationServices.AXUIElementPerformAction(
+            ax_windows[0], ApplicationServices.kAXRaiseAction)
+    ApplicationServices.AXUIElementSetAttributeValue(
+        ax_app, ApplicationServices.kAXFrontmostAttribute, True)
+    for _ in range(6):
+        if is_front():
+            return
+        time.sleep(.1)
+
+    subprocess.run(['/usr/bin/osascript', '-e',
+                    'tell application "System Events" to tell process "Dock" '
+                    'to click UI element "iPhone Mirroring" of list 1'],
+                   capture_output=True, timeout=5)
+    for _ in range(6):
+        if is_front():
+            return
+        time.sleep(.1)
+    raise RuntimeError('Could not activate iPhone Mirroring; bring its window forward and press Play again')
+
+
 def play_words(snapshot):
     error = ''
     board_changed = False
     try:
-        target = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(snapshot['pid'])
-        if target is None:
-            raise RuntimeError('iPhone Mirroring is no longer open')
-        target.activateWithOptions_(AppKit.NSApplicationActivateIgnoringOtherApps)
-        time.sleep(.25)
+        focus_mirroring(snapshot['pid'])
         for index, item in enumerate(snapshot['words']):
             if play_stop.is_set():
                 break
@@ -498,9 +537,7 @@ def play_words(snapshot):
             if not same_board(snapshot):
                 board_changed = True
                 break
-            front = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
-            if front is None or front.processIdentifier() != snapshot['pid']:
-                raise RuntimeError('Stopped because another app became active')
+            focus_mirroring(snapshot['pid'])
             bounds = available['bounds']
             if not bounds:
                 raise RuntimeError('Could not locate the Mirroring window')

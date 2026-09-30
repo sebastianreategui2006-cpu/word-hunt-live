@@ -14,7 +14,7 @@ The app may need **Screen & System Audio Recording** permission for the terminal
 
 ## Use
 
-The 4×4 grid is found automatically. If detection misses it, drag a box around the tiles in the preview. Correct any wrong letters in the grid and click **Correct letters**. Clear letter shapes use learned templates for fast updates; uncertain shapes are checked with OCR. The word list favors familiar long words and filters capitalized names and rare entries. Each suggested word includes a numbered tile path. Click **Play board** to start automatic swipes; click **Stop** to end them. The player watches for falling tiles and solves the new board.
+The 4×4 grid is found automatically. If detection misses it, drag a box around the tiles in the preview. Correct any wrong letters in the grid and click **Correct letters**. Clear letter shapes use learned templates for fast updates; uncertain shapes are checked with OCR. The word list favors familiar long words and filters capitalized names and rare entries. Each suggested word includes a numbered tile path. Click **Play board** to start automatic swipes; click **Stop** to end them. The player brings iPhone Mirroring forward when playback starts, watches for falling tiles, and solves the new board.
 
 The app remembers corrected tile readings and word feedback in a local `memory.sqlite3` file created beside the app. Each downloaded copy starts with its own empty memory. No mirror images or memory data are sent to a server. The web page is served only on the Mac at `127.0.0.1`.
 
@@ -22,6 +22,7 @@ The app remembers corrected tile readings and word feedback in a local `memory.s
 
 - macOS, Apple iPhone Mirroring, a paired iPhone, and Python 3.11–3.14 are required for automatic screen reading and swiping.
 - macOS permissions must be granted on each person's own Mac. A public website alone cannot access or control their iPhone Mirroring window.
+- Keep the iPhone Mirroring window open on the same Mac desktop while playing. Playback pauses if the app cannot bring that window forward.
 - The word list and OCR can occasionally be wrong, and the game may reject a suggested word.
 
 The solver is an independent project and is not affiliated with Apple, GamePigeon, or The Word Finder.
