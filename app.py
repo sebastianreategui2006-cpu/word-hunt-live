@@ -10,6 +10,7 @@ import threading
 import time
 from collections import deque
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
@@ -103,6 +104,23 @@ def fast_letter(pattern):
     return letter, distance
 
 
+def confident_template_letter(pattern):
+    if pattern is None or not templates:
+        return ''
+    by_letter = {}
+    for letter, sample in templates:
+        distance = (pattern ^ sample).bit_count() / 784
+        by_letter[letter] = min(distance, by_letter.get(letter, 1))
+    closest = sorted(by_letter.items(), key=lambda item: item[1])
+    if len(closest) < 2:
+        return ''
+    (letter, best), (_, second) = closest[:2]
+    if ((best <= .02 and second - best >= .012)
+            or (best <= .09 and second - best >= .02)):
+        return letter
+    return ''
+
+
 def detect_grid(image):
     small = image.copy()
     small.thumbnail((450, 900))
@@ -167,6 +185,23 @@ def boxes_from_crop(image, crop):
             for row in range(4) for col in range(4)]
 
 
+def reuse_grid(image, boxes):
+    if len(boxes) != 16:
+        return None
+    for x0, y0, x1, y1 in boxes:
+        x = int(x0 + (x1-x0)*.1)
+        y = int(y0 + (y1-y0)*.1)
+        if not (0 <= x < image.width and 0 <= y < image.height):
+            return None
+        r, g, b = image.getpixel((x, y))
+        if not (r > 150 and g > 150 and b > 140 and max(r,g,b)-min(r,g,b) < 40):
+            return None
+    x0 = min(b[0] for b in boxes); y0 = min(b[1] for b in boxes)
+    x1 = max(b[2] for b in boxes); y1 = max(b[3] for b in boxes)
+    return [x0/image.width, y0/image.height,
+            (x1-x0)/image.width, (y1-y0)/image.height], boxes
+
+
 def recognize_variant(image, mode):
     if mode == 'full':
         image = ImageEnhance.Contrast(image).enhance(1.8)
@@ -225,7 +260,8 @@ def read_board(image, boxes):
             elif sig in ocr_cache:
                 letter, strength = ocr_cache[sig]
             else:
-                letter, strength = recognize_tile(tile)
+                letter = confident_template_letter(pattern)
+                letter, strength = (letter, 2) if letter else recognize_tile(tile)
                 ocr_cache[sig] = (letter, strength)
             letters.append(letter)
             confidence.append(strength)
@@ -258,7 +294,8 @@ def dictionary():
     words = set()
     for raw in path.read_text(errors='ignore').splitlines():
         word = raw.strip().lower()
-        if 3 <= len(word) <= 16 and word.isascii() and word.isalpha():
+        if (3 <= len(word) <= 16 and word.isascii() and word.isalpha()
+                and raw == raw.lower()):
             words.add(word)
     WORDS = words
     root = {}
@@ -269,6 +306,11 @@ def dictionary():
         node['$'] = True
     TRIE = root
     return root
+
+
+@lru_cache(maxsize=100000)
+def familiarity(word):
+    return zipf_frequency(word, 'en')
 
 
 def solve(board):
@@ -298,11 +340,15 @@ def solve(board):
     points = {3:100, 4:400, 5:800, 6:1400, 7:1800, 8:2200}
     result = []
     for word, path in found.items():
-        freq = zipf_frequency(word, 'en')
-        if freq < 2.0 and adjustments.get(word, 0) <= 0:
+        feedback = adjustments.get(word, 0)
+        if feedback < 0:
+            continue
+        freq = familiarity(word)
+        minimum = 2.85 if len(word) >= 7 else (3.0 if len(word) >= 5 else 3.5)
+        if freq < minimum and feedback == 0:
             continue
         score = points.get(len(word), 2200 + (len(word)-8)*400)
-        rank = score + freq*35 + adjustments.get(word, 0)*500
+        rank = min(len(word), 8)*300 + max(0, len(word)-8)*80 + freq*180 + feedback*500
         result.append(dict(word=word.upper(), path=path, points=score, frequency=round(freq, 1), rank=rank))
     result.sort(key=lambda x: (-x['rank'], -x['frequency'], x['word']))
     return result
@@ -319,6 +365,9 @@ def scan():
         if not chosen:
             state.update(status='Open Apple iPhone Mirroring to begin', window=None)
             return
+        previous_window = state['window']
+        previous_size = state['capture_size']
+        previous_boxes = state['boxes']
         state['window'] = chosen['id']
         state['window_pid'] = chosen['pid']
         image = capture(chosen['id'])
@@ -331,14 +380,16 @@ def scan():
             small.save(buffer, format='JPEG', quality=75)
             state['image'] = 'data:image/jpeg;base64,' + base64.b64encode(buffer.getvalue()).decode()
             state['frame_signature'] = frame_signature
-        detected = detect_grid(image)
         manual = get_setting('manual_crop')
         if manual:
             crop, boxes = manual, boxes_from_crop(image, manual)
-        elif detected:
-            crop, boxes = detected
         else:
-            crop, boxes = None, None
+            detected = (reuse_grid(image, previous_boxes)
+                        if previous_window == chosen['id'] and previous_size == image.size
+                        else None)
+            if detected is None:
+                detected = detect_grid(image)
+            crop, boxes = detected if detected else (None, None)
         state['crop'] = crop
         state['boxes'] = boxes or []
         if boxes:
@@ -569,8 +620,12 @@ def api_word():
     adjustment = request.json.get('adjustment')
     if not word.isalpha() or adjustment not in (-1,1):
         return jsonify(error='Invalid feedback'), 400
-    with db() as con:
-        con.execute('INSERT INTO words VALUES (?,?) ON CONFLICT(word) DO UPDATE SET adjustment=adjustment+excluded.adjustment', (word, adjustment))
+    with lock:
+        with db() as con:
+            con.execute('INSERT INTO words VALUES (?,?) ON CONFLICT(word) DO UPDATE SET adjustment=adjustment+excluded.adjustment', (word, adjustment))
+        if len(state['board']) == 16 and '?' not in state['board']:
+            state['words'] = solve(list(state['board']))
+            state['status'] = f'Live • {len(state["words"])} words'
     return jsonify(ok=True)
 
 
